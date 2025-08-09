@@ -6,7 +6,7 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import Deque, Dict, Generator, List, Optional, Set, Tuple
 
 import requests
@@ -138,7 +138,7 @@ def init_db(db_path: str) -> sqlite3.Connection:
 
 
 def now_iso() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def upsert_article(
@@ -307,6 +307,24 @@ def iter_citations_for_doi(
             break
 
 
+def safe_folder_name_from_title(title: str) -> str:
+    """Create a safe folder name from article title."""
+    if not title:
+        return "unknown_article"
+    
+    # Remove problematic characters and limit length
+    safe_name = re.sub(r'[<>:"/\\|?*]', '_', title)
+    safe_name = re.sub(r'[^\w\s\-_.]', '_', safe_name)
+    safe_name = re.sub(r'\s+', '_', safe_name)
+    safe_name = safe_name.strip('_.')
+    
+    # Limit length to avoid filesystem issues
+    if len(safe_name) > 100:
+        safe_name = safe_name[:100].rstrip('_.')
+    
+    return safe_name or "unknown_article"
+
+
 def safe_filename_from_doi(doi: str) -> str:
     # Replace slashes and other problematic characters
     name = re.sub(r"[^a-zA-Z0-9._-]", "_", doi)
@@ -344,16 +362,18 @@ def try_download_pdf_for_article(
     doi: str,
     direct_pdf_url: Optional[str],
     s3_client: Optional[boto3.client],
+    folder_name: str,
     use_scihub: bool,
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     # Returns: (pdf_url_used, s3_key, source_pdf)
     filename = safe_filename_from_doi(doi)
+    s3_key = f"{folder_name}/{filename}"  # Add folder prefix
 
     # Try direct OA link first
     if direct_pdf_url:
-        success = download_pdf_to_s3(direct_pdf_url, s3_client, filename, verify_tls=True)
+        success = download_pdf_to_s3(direct_pdf_url, s3_client, s3_key, verify_tls=True)
         if success:
-            return (direct_pdf_url, filename, "openalex")
+            return (direct_pdf_url, s3_key, "openalex")
 
     if not use_scihub:
         return (None, None, None)
@@ -374,9 +394,9 @@ def try_download_pdf_for_article(
         res = searcher.search_paper_by_doi(doi)
         if res and res.get("status") == "success" and res.get("pdf_url"):
             scihub_pdf_url = res.get("pdf_url")
-            success = download_pdf_to_s3(scihub_pdf_url, s3_client, filename, verify_tls=False)
+            success = download_pdf_to_s3(scihub_pdf_url, s3_client, s3_key, verify_tls=False)
             if success:
-                return (scihub_pdf_url, filename, "scihub")
+                return (scihub_pdf_url, s3_key, "scihub")
     except Exception:
         pass
 
@@ -389,6 +409,7 @@ def process_article(
     parent_doi: Optional[str],
     distance: int,
     s3_client: Optional[boto3.client],
+    folder_name: str,
     mailto: Optional[str],
     per_parent_limit: int,
     request_pause_s: float,
@@ -414,7 +435,7 @@ def process_article(
 
     # Try to download PDF
     pdf_url_used, s3_key, source_pdf = try_download_pdf_for_article(
-        norm_doi, meta.best_pdf_url, s3_client, use_scihub
+        norm_doi, meta.best_pdf_url, s3_client, folder_name, use_scihub
     )
 
     # Persist self
@@ -456,10 +477,20 @@ def bfs_crawl(
     conn = init_db(db_path)
     s3_client = init_s3_client()
 
+    # Get seed article title for folder name
+    seed_norm = normalize_doi(seed_doi)
+    seed_work = get_openalex_work_by_doi(seed_norm, mailto)
+    if seed_work:
+        seed_meta = extract_meta_from_openalex(seed_work, seed_norm)
+        folder_name = safe_folder_name_from_title(seed_meta.title)
+    else:
+        folder_name = safe_folder_name_from_title(seed_norm)
+    
+    print(f"PDFs will be saved to S3 folder: {folder_name}")
+
     visited: Set[str] = set()
     queue: Deque[Tuple[str, Optional[str], int]] = deque()  # (doi, parent_doi, distance)
 
-    seed_norm = normalize_doi(seed_doi)
     queue.append((seed_norm, None, 0))
 
     processed = 0
@@ -479,6 +510,7 @@ def bfs_crawl(
                 parent_doi=parent,
                 distance=dist,
                 s3_client=s3_client,
+                folder_name=folder_name,
                 mailto=mailto,
                 per_parent_limit=per_parent_limit,
                 request_pause_s=request_pause_s,
@@ -520,7 +552,6 @@ def main(argv: List[str]) -> None:
     print(
         f"Starting crawl from DOI={normalize_doi(args.doi)}, depth={args.max_depth}, per_parent_limit={args.per_parent_limit}, max_total={args.max_total}"
     )
-    print(f"PDFs will be saved to S3 bucket: {S3_BUCKET_NAME}")
 
     bfs_crawl(
         seed_doi=args.doi,

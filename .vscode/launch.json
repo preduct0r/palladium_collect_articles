@@ -11,7 +11,7 @@
             "request": "launch",
             "program": "main.py",
             "console": "integratedTerminal",
-            "args": ["--doi", "10.1016/j.cell.2019.05.036", "--max-depth", "1"]
+            "args": ["--doi", "10.1038/srep37043", "--max-depth", "0"]
         }
     ]
 }

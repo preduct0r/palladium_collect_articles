@@ -90,8 +90,17 @@ python main.py \
     --per-parent-limit 10
 ```
 
+При запуске скрипт:
+1. Получит заголовок статьи с DOI `10.1038/s41586-020-2649-2`
+2. Создаст безопасное имя папки (например, `Quantum_Computing_Breakthrough_in_Machine_Learning`)
+3. Сохранит все найденные PDF в эту папку в S3: `palladium-articles/Quantum_Computing_Breakthrough_in_Machine_Learning/`
+4. В локальной БД будут сохранены полные S3 пути к файлам
+
 ## Хранение данных
 
 - **PDF-файлы**: Сохраняются в S3 бакет `palladium-articles` (Yandex Object Storage)
+  - Все PDF файлы сохраняются в папку, названную по заголовку исходной (seed) статьи
+  - Название папки автоматически очищается от недопустимых символов
+  - Пример структуры: `palladium-articles/Deep_Learning_Approach_to_Pattern_Recognition/article1.pdf`
 - **Метаданные**: Сохраняются в локальную SQLite базу данных (по умолчанию `./articles.db`)
-- **S3 ключи**: Имена файлов в S3 генерируются на основе DOI статьи 
+- **S3 ключи**: В базе данных сохраняются полные S3 пути включая папку (например, `folder_name/article.pdf`) 
