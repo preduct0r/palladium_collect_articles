@@ -4,7 +4,9 @@ import re
 import sqlite3
 import sys
 import time
+import threading
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, UTC
 from typing import Deque, Dict, Generator, List, Optional, Set, Tuple
@@ -37,6 +39,31 @@ class ArticleMeta:
     oa_status: Optional[str]
     best_pdf_url: Optional[str]
     cited_by_count: Optional[int]
+
+
+def parse_doi_with_depth(doi_spec: str, default_depth: int) -> Tuple[str, int]:
+    """Parse DOI specification that can include depth (e.g., 'DOI:2' or just 'DOI')."""
+    if ':' in doi_spec and doi_spec.count(':') >= 2:
+        # This might be a URL like https://doi.org/10.1038/... 
+        # Check if it's a depth specification or a URL
+        parts = doi_spec.rsplit(':', 1)
+        try:
+            depth = int(parts[1])
+            return parts[0], depth
+        except ValueError:
+            # Not a depth specification, treat as regular DOI
+            return doi_spec, default_depth
+    elif ':' in doi_spec:
+        # Could be either DOI:depth or a URL component
+        parts = doi_spec.rsplit(':', 1)
+        try:
+            depth = int(parts[1])
+            return parts[0], depth
+        except ValueError:
+            # Not a depth specification, treat as regular DOI
+            return doi_spec, default_depth
+    else:
+        return doi_spec, default_depth
 
 
 def normalize_doi(doi: str) -> str:
@@ -464,6 +491,161 @@ def process_article(
     return children_dois
 
 
+def process_single_doi(
+    doi: str,
+    db_path: str,
+    mailto: Optional[str],
+    max_depth: int,
+    max_total: Optional[int],
+    per_parent_limit: int,
+    request_pause_s: float,
+    use_scihub: bool,
+    worker_id: int,
+) -> Dict[str, any]:
+    """Process a single DOI with its own database connection and return results."""
+    try:
+        print(f"[Worker {worker_id}] Starting crawl for DOI: {normalize_doi(doi)} (depth: {max_depth})")
+        
+        # Create a thread-safe database connection
+        conn = init_db(db_path)
+        s3_client = init_s3_client()
+
+        # Get seed article title for folder name
+        seed_norm = normalize_doi(doi)
+        seed_work = get_openalex_work_by_doi(seed_norm, mailto)
+        if seed_work:
+            seed_meta = extract_meta_from_openalex(seed_work, seed_norm)
+            folder_name = safe_folder_name_from_title(seed_meta.title)
+        else:
+            folder_name = safe_folder_name_from_title(seed_norm)
+        
+        print(f"[Worker {worker_id}] PDFs will be saved to S3 folder: {folder_name}")
+
+        visited: Set[str] = set()
+        queue: Deque[Tuple[str, Optional[str], int]] = deque()  # (doi, parent_doi, distance)
+
+        queue.append((seed_norm, None, 0))
+        processed = 0
+
+        while queue:
+            current_doi, parent, dist = queue.popleft()
+            if max_total is not None and processed >= max_total:
+                break
+            if current_doi in visited:
+                continue
+            visited.add(current_doi)
+
+            try:
+                children = process_article(
+                    conn,
+                    current_doi,
+                    parent_doi=parent,
+                    distance=dist,
+                    s3_client=s3_client,
+                    folder_name=folder_name,
+                    mailto=mailto,
+                    per_parent_limit=per_parent_limit,
+                    request_pause_s=request_pause_s,
+                    use_scihub=use_scihub,
+                )
+            except Exception as e:
+                print(f"[Worker {worker_id}] Error processing {current_doi}: {e}")
+                children = []
+
+            processed += 1
+
+            if dist < max_depth:
+                for child in children:
+                    if child not in visited:
+                        queue.append((child, current_doi, dist + 1))
+
+            # Be nice to APIs
+            time.sleep(request_pause_s)
+
+        conn.close()
+        
+        result = {
+            'doi': doi,
+            'folder_name': folder_name,
+            'processed_count': processed,
+            'max_depth': max_depth,
+            'status': 'success'
+        }
+        print(f"[Worker {worker_id}] Completed DOI: {doi} (depth: {max_depth}), processed {processed} articles")
+        return result
+        
+    except Exception as e:
+        print(f"[Worker {worker_id}] Failed to process DOI {doi}: {e}")
+        return {
+            'doi': doi,
+            'folder_name': None,
+            'processed_count': 0,
+            'max_depth': max_depth,
+            'status': 'failed',
+            'error': str(e)
+        }
+
+
+def process_multiple_dois(
+    doi_specs: List[str],
+    db_path: str,
+    mailto: Optional[str],
+    default_max_depth: int,
+    max_total: Optional[int],
+    per_parent_limit: int,
+    request_pause_s: float,
+    use_scihub: bool,
+    max_workers: int,
+) -> List[Dict[str, any]]:
+    """Process multiple DOIs in parallel, each with potentially different depths."""
+    
+    # Parse DOI specifications to extract DOI and individual depths
+    parsed_dois = []
+    for doi_spec in doi_specs:
+        doi, depth = parse_doi_with_depth(doi_spec, default_max_depth)
+        parsed_dois.append((doi, depth))
+    
+    if len(parsed_dois) == 1:
+        # Single DOI - no need for threading
+        doi, depth = parsed_dois[0]
+        return [process_single_doi(
+            doi, db_path, mailto, depth, max_total, 
+            per_parent_limit, request_pause_s, use_scihub, 1
+        )]
+    
+    print(f"Processing {len(parsed_dois)} DOIs in parallel with {max_workers} workers...")
+    results = []
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all DOI processing tasks
+        future_to_doi = {
+            executor.submit(
+                process_single_doi,
+                doi, db_path, mailto, depth, max_total,
+                per_parent_limit, request_pause_s, use_scihub, idx + 1
+            ): (doi, depth) for idx, (doi, depth) in enumerate(parsed_dois)
+        }
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_doi):
+            doi, depth = future_to_doi[future]
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                print(f"DOI {doi} generated an exception: {e}")
+                results.append({
+                    'doi': doi,
+                    'folder_name': None,
+                    'processed_count': 0,
+                    'max_depth': depth,
+                    'status': 'failed',
+                    'error': str(e)
+                })
+    
+    return results
+
+
 def bfs_crawl(
     seed_doi: str,
     db_path: str,
@@ -534,36 +716,64 @@ def bfs_crawl(
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Crawl citations (cited_by) starting from a DOI, download PDFs to S3, and store metadata.")
-    p.add_argument("--doi", required=True, help="Seed DOI or URL, e.g., 10.1038/s41586-020-2649-2 or https://doi.org/...")
+    p = argparse.ArgumentParser(description="Crawl citations (cited_by) starting from one or more DOIs, download PDFs to S3, and store metadata.")
+    p.add_argument("--doi", nargs='+', required=True, help="One or more seed DOIs or URLs. Format: 'DOI' or 'DOI:depth'. Examples: '10.1038/s41586-020-2649-2:2' '10.1126/science.abc123:1'")
     p.add_argument("--db", default=os.path.abspath("./articles.db"), help="Path to SQLite database file")
     p.add_argument("--mailto", default=None, help="Email for OpenAlex polite usage header")
-    p.add_argument("--max-depth", type=int, default=1, help="BFS depth (0=only seed, 1=seed + direct citers)")
-    p.add_argument("--max-total", type=int, default=None, help="Max total articles to process in this run")
+    p.add_argument("--max-depth", type=int, default=1, help="Default BFS depth for DOIs without explicit depth (0=only seed, 1=seed + direct citers)")
+    p.add_argument("--max-total", type=int, default=None, help="Max total articles to process in this run per DOI")
     p.add_argument("--per-parent-limit", type=int, default=50, help="Max citing papers to fetch per parent")
     p.add_argument("--sleep", type=float, default=1.0, help="Pause between requests (seconds)")
     p.add_argument("--no-scihub", action="store_true", help="Disable Sci-Hub fallback")
+    p.add_argument("--max-workers", type=int, default=3, help="Maximum number of parallel workers for processing multiple DOIs")
     return p.parse_args(argv)
 
 
 def main(argv: List[str]) -> None:
     args = parse_args(argv)
 
-    print(
-        f"Starting crawl from DOI={normalize_doi(args.doi)}, depth={args.max_depth}, per_parent_limit={args.per_parent_limit}, max_total={args.max_total}"
-    )
+    print(f"Starting crawl for {len(args.doi)} DOI(s):")
+    for i, doi_spec in enumerate(args.doi, 1):
+        doi, depth = parse_doi_with_depth(doi_spec, args.max_depth)
+        print(f"  {i}. {normalize_doi(doi)} (depth: {depth})")
+    
+    print(f"Parameters: default_depth={args.max_depth}, per_parent_limit={args.per_parent_limit}, max_total={args.max_total}")
+    
+    if len(args.doi) > 1:
+        print(f"Using {args.max_workers} parallel workers")
 
-    bfs_crawl(
-        seed_doi=args.doi,
+    # Process DOIs (single or multiple)
+    results = process_multiple_dois(
+        doi_specs=args.doi,
         db_path=args.db,
         mailto=args.mailto,
-        max_depth=args.max_depth,
+        default_max_depth=args.max_depth,
         max_total=args.max_total,
         per_parent_limit=args.per_parent_limit,
         request_pause_s=args.sleep,
         use_scihub=not args.no_scihub,
+        max_workers=args.max_workers,
     )
 
+    # Print summary
+    print("\n=== SUMMARY ===")
+    total_processed = 0
+    successful_dois = 0
+    
+    for result in results:
+        status_symbol = "✅" if result['status'] == 'success' else "❌"
+        print(f"{status_symbol} {result['doi']} (depth: {result['max_depth']}): {result['processed_count']} articles")
+        if result['folder_name']:
+            print(f"   → S3 folder: {result['folder_name']}")
+        if result['status'] == 'failed' and 'error' in result:
+            print(f"   → Error: {result['error']}")
+        
+        if result['status'] == 'success':
+            successful_dois += 1
+            total_processed += result['processed_count']
+    
+    print(f"\nProcessed {successful_dois}/{len(args.doi)} DOIs successfully")
+    print(f"Total articles collected: {total_processed}")
     print("Done.")
 
 
