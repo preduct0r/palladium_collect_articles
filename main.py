@@ -10,9 +10,21 @@ from datetime import datetime
 from typing import Deque, Dict, Generator, List, Optional, Set, Tuple
 
 import requests
+import boto3
+from botocore.exceptions import ClientError
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 OPENALEX_BASE_URL = "https://api.openalex.org"
 DEFAULT_USER_AGENT = "collect-articles-bot/1.0 (mailto:example@example.com)"
+
+# S3 Configuration
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL")
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
+S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID")
+S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY")
 
 
 @dataclass
@@ -34,12 +46,51 @@ def normalize_doi(doi: str) -> str:
     return doi
 
 
-def ensure_dirs(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
+def init_s3_client() -> Optional[boto3.client]:
+    """Initialize S3 client with credentials from environment variables."""
+    if not all([S3_ENDPOINT_URL, S3_BUCKET_NAME, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY]):
+        print("Warning: S3 credentials not fully configured. PDFs will not be uploaded to S3.")
+        return None
+    
+    try:
+        s3_client = boto3.client(
+            's3',
+            endpoint_url=S3_ENDPOINT_URL,
+            aws_access_key_id=S3_ACCESS_KEY_ID,
+            aws_secret_access_key=S3_SECRET_ACCESS_KEY
+        )
+        return s3_client
+    except Exception as e:
+        print(f"Error initializing S3 client: {e}")
+        return None
+
+
+def upload_file_to_s3(s3_client: boto3.client, file_path: str, s3_key: str) -> bool:
+    """Upload a file to S3 bucket."""
+    try:
+        s3_client.upload_file(file_path, S3_BUCKET_NAME, s3_key)
+        return True
+    except ClientError as e:
+        print(f"Error uploading {file_path} to S3: {e}")
+        return False
+
+
+def upload_content_to_s3(s3_client: boto3.client, content: bytes, s3_key: str) -> bool:
+    """Upload content directly to S3 bucket."""
+    try:
+        s3_client.put_object(Bucket=S3_BUCKET_NAME, Key=s3_key, Body=content)
+        return True
+    except ClientError as e:
+        print(f"Error uploading content to S3 key {s3_key}: {e}")
+        return False
 
 
 def init_db(db_path: str) -> sqlite3.Connection:
-    ensure_dirs(os.path.dirname(db_path) or ".")
+    # Ensure parent directory exists for the database file
+    db_dir = os.path.dirname(db_path)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+    
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
@@ -264,38 +315,45 @@ def safe_filename_from_doi(doi: str) -> str:
     return name
 
 
-def download_pdf(url: str, dest_dir: str, filename: str, verify_tls: bool) -> Optional[str]:
-    ensure_dirs(dest_dir)
-    path = os.path.join(dest_dir, filename)
+def download_pdf_to_s3(url: str, s3_client: Optional[boto3.client], s3_key: str, verify_tls: bool) -> bool:
+    """Download PDF and upload directly to S3."""
+    if not s3_client:
+        return False
+    
     try:
         with requests.get(url, stream=True, timeout=60, verify=verify_tls) as r:
             if r.status_code != 200 or "pdf" not in (r.headers.get("Content-Type") or "").lower():
                 # Even if content-type not pdf, try saving based on URL ending
                 if not url.lower().endswith(".pdf") and r.status_code != 200:
-                    return None
-            with open(path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-        return path
-    except Exception:
-        return None
+                    return False
+            
+            # Collect all content in memory
+            content = b''
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    content += chunk
+            
+            # Upload to S3
+            return upload_content_to_s3(s3_client, content, s3_key)
+    except Exception as e:
+        print(f"Error downloading PDF from {url}: {e}")
+        return False
 
 
 def try_download_pdf_for_article(
     doi: str,
     direct_pdf_url: Optional[str],
-    out_dir: str,
+    s3_client: Optional[boto3.client],
     use_scihub: bool,
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    # Returns: (pdf_url_used, pdf_path, source_pdf)
+    # Returns: (pdf_url_used, s3_key, source_pdf)
     filename = safe_filename_from_doi(doi)
 
     # Try direct OA link first
     if direct_pdf_url:
-        pdf_path = download_pdf(direct_pdf_url, out_dir, filename, verify_tls=True)
-        if pdf_path:
-            return (direct_pdf_url, pdf_path, "openalex")
+        success = download_pdf_to_s3(direct_pdf_url, s3_client, filename, verify_tls=True)
+        if success:
+            return (direct_pdf_url, filename, "openalex")
 
     if not use_scihub:
         return (None, None, None)
@@ -303,7 +361,7 @@ def try_download_pdf_for_article(
     # Lazy import Sci-Hub only when needed to avoid import-time errors
     SciHubSearcher = None
     try:
-        from sci_hub import SciHubSearcher as _SciHubSearcher  # type: ignore
+        from sci_hub import SciHubSearcher as _SciHubSearcher  # Import from local sci_hub.py
         SciHubSearcher = _SciHubSearcher
     except Exception:
         SciHubSearcher = None
@@ -316,9 +374,9 @@ def try_download_pdf_for_article(
         res = searcher.search_paper_by_doi(doi)
         if res and res.get("status") == "success" and res.get("pdf_url"):
             scihub_pdf_url = res.get("pdf_url")
-            pdf_path = download_pdf(scihub_pdf_url, out_dir, filename, verify_tls=False)
-            if pdf_path:
-                return (scihub_pdf_url, pdf_path, "scihub")
+            success = download_pdf_to_s3(scihub_pdf_url, s3_client, filename, verify_tls=False)
+            if success:
+                return (scihub_pdf_url, filename, "scihub")
     except Exception:
         pass
 
@@ -330,7 +388,7 @@ def process_article(
     doi: str,
     parent_doi: Optional[str],
     distance: int,
-    out_dir: str,
+    s3_client: Optional[boto3.client],
     mailto: Optional[str],
     per_parent_limit: int,
     request_pause_s: float,
@@ -355,8 +413,8 @@ def process_article(
         )
 
     # Try to download PDF
-    pdf_url_used, pdf_path, source_pdf = try_download_pdf_for_article(
-        norm_doi, meta.best_pdf_url, out_dir, use_scihub
+    pdf_url_used, s3_key, source_pdf = try_download_pdf_for_article(
+        norm_doi, meta.best_pdf_url, s3_client, use_scihub
     )
 
     # Persist self
@@ -366,7 +424,7 @@ def process_article(
         distance=distance,
         found_from_doi=parent_doi,
         pdf_url=pdf_url_used,
-        pdf_path=pdf_path,
+        pdf_path=s3_key,  # This now contains the S3 key instead of local path
         source_pdf=source_pdf,
     )
 
@@ -388,7 +446,6 @@ def process_article(
 def bfs_crawl(
     seed_doi: str,
     db_path: str,
-    out_dir: str,
     mailto: Optional[str],
     max_depth: int,
     max_total: Optional[int],
@@ -397,6 +454,7 @@ def bfs_crawl(
     use_scihub: bool,
 ) -> None:
     conn = init_db(db_path)
+    s3_client = init_s3_client()
 
     visited: Set[str] = set()
     queue: Deque[Tuple[str, Optional[str], int]] = deque()  # (doi, parent_doi, distance)
@@ -420,7 +478,7 @@ def bfs_crawl(
                 doi,
                 parent_doi=parent,
                 distance=dist,
-                out_dir=out_dir,
+                s3_client=s3_client,
                 mailto=mailto,
                 per_parent_limit=per_parent_limit,
                 request_pause_s=request_pause_s,
@@ -444,10 +502,9 @@ def bfs_crawl(
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Crawl citations (cited_by) starting from a DOI, download PDFs, and store metadata.")
+    p = argparse.ArgumentParser(description="Crawl citations (cited_by) starting from a DOI, download PDFs to S3, and store metadata.")
     p.add_argument("--doi", required=True, help="Seed DOI or URL, e.g., 10.1038/s41586-020-2649-2 or https://doi.org/...")
     p.add_argument("--db", default=os.path.abspath("./articles.db"), help="Path to SQLite database file")
-    p.add_argument("--out-dir", default=os.path.abspath("./pdfs"), help="Directory to save PDFs")
     p.add_argument("--mailto", default=None, help="Email for OpenAlex polite usage header")
     p.add_argument("--max-depth", type=int, default=1, help="BFS depth (0=only seed, 1=seed + direct citers)")
     p.add_argument("--max-total", type=int, default=None, help="Max total articles to process in this run")
@@ -459,16 +516,15 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
 
 def main(argv: List[str]) -> None:
     args = parse_args(argv)
-    ensure_dirs(args.out_dir)
 
     print(
         f"Starting crawl from DOI={normalize_doi(args.doi)}, depth={args.max_depth}, per_parent_limit={args.per_parent_limit}, max_total={args.max_total}"
     )
+    print(f"PDFs will be saved to S3 bucket: {S3_BUCKET_NAME}")
 
     bfs_crawl(
         seed_doi=args.doi,
         db_path=args.db,
-        out_dir=args.out_dir,
         mailto=args.mailto,
         max_depth=args.max_depth,
         max_total=args.max_total,
