@@ -431,6 +431,7 @@ def process_article(
     request_pause_s: float,
     use_scihub: bool,
     min_citations: int,
+    min_year: Optional[int],
 ) -> List[str]:
     norm_doi = normalize_doi(doi)
 
@@ -473,6 +474,10 @@ def process_article(
         child_doi = child_meta.doi
         if not child_doi:
             continue  # skip if no DOI
+        # Filter by publication year
+        if min_year is not None:
+            if child_meta.year is None or child_meta.year < min_year:
+                continue
         # Filter by citation threshold
         child_citations = child_meta.cited_by_count if child_meta.cited_by_count is not None else 0
         if child_citations < min_citations:
@@ -499,6 +504,7 @@ def bfs_crawl(
     request_pause_s: float,
     use_scihub: bool,
     min_citations: int,
+    min_year: Optional[int],
 ) -> None:
     conn = init_db(db_path)
     s3_client = init_s3_client()
@@ -542,6 +548,7 @@ def bfs_crawl(
                 request_pause_s=request_pause_s,
                 use_scihub=use_scihub,
                 min_citations=min_citations,
+                min_year=min_year,
             )
         except Exception as e:
             print(f"Error processing {doi}: {e}")
@@ -569,6 +576,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--max-total", type=int, default=None, help="Max total articles to process in this run")
     p.add_argument("--per-parent-limit", type=int, default=50, help="Max citing papers to fetch per parent")
     p.add_argument("--min-citations", type=int, default=0, help="Skip children with cited_by_count below this threshold")
+    p.add_argument("--min-year", type=int, default=None, help="Skip children published before this year (also skips if year is unknown)")
     p.add_argument("--sleep", type=float, default=1.0, help="Pause between requests (seconds)")
     p.add_argument("--no-scihub", action="store_true", help="Disable Sci-Hub fallback")
     return p.parse_args(argv)
@@ -591,6 +599,7 @@ def main(argv: List[str]) -> None:
         request_pause_s=args.sleep,
         use_scihub=not args.no_scihub,
         min_citations=args.min_citations,
+        min_year=args.min_year,
     )
 
     print("Done.")
