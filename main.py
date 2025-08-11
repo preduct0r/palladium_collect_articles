@@ -4,9 +4,18 @@ import re
 import sqlite3
 import sys
 import time
+import threading
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from multiprocessing import Process, Queue
 from dataclasses import dataclass
-from datetime import datetime, UTC
+from datetime import datetime
+try:
+    from datetime import UTC
+except ImportError:
+    # For Python < 3.11
+    import datetime as dt
+    UTC = dt.timezone.utc
 from typing import Deque, Dict, Generator, List, Optional, Set, Tuple
 
 import requests
@@ -606,16 +615,107 @@ def bfs_crawl(
     conn.close()
 
 
+def run_single_doi_process(
+    doi: str,
+    db_path: str,
+    mailto: Optional[str],
+    max_depth: int,
+    max_total: Optional[int],
+    per_parent_limit: int,
+    sleep: float,
+    use_scihub: bool,
+    min_citations: int,
+    min_year: Optional[int],
+    process_id: int,
+) -> None:
+    """Run crawling for a single DOI in a separate process."""
+    try:
+        print(f"[Process {process_id}] Starting crawl for DOI: {normalize_doi(doi)}")
+        
+        # Create process-specific database to avoid conflicts
+        base_name = os.path.splitext(db_path)[0]
+        process_db_path = f"{base_name}_process_{process_id}.db"
+        
+        bfs_crawl(
+            seed_doi=doi,
+            db_path=process_db_path,
+            mailto=mailto,
+            max_depth=max_depth,
+            max_total=max_total,
+            per_parent_limit=per_parent_limit,
+            request_pause_s=sleep,
+            use_scihub=use_scihub,
+            min_citations=min_citations,
+            min_year=min_year,
+        )
+        
+        print(f"[Process {process_id}] Completed crawl for DOI: {normalize_doi(doi)}")
+    except Exception as e:
+        print(f"[Process {process_id}] Error processing DOI {doi}: {e}")
+
+
+def run_multiple_dois_multiprocess(
+    dois: List[str],
+    db_path: str,
+    mailto: Optional[str],
+    max_depth: int,
+    max_total: Optional[int],
+    per_parent_limit: int,
+    sleep: float,
+    use_scihub: bool,
+    min_citations: int,
+    min_year: Optional[int],
+) -> None:
+    """Run multiple DOIs in separate processes."""
+    if len(dois) == 1:
+        # Single DOI - run directly
+        bfs_crawl(
+            seed_doi=dois[0],
+            db_path=db_path,
+            mailto=mailto,
+            max_depth=max_depth,
+            max_total=max_total,
+            per_parent_limit=per_parent_limit,
+            request_pause_s=sleep,
+            use_scihub=use_scihub,
+            min_citations=min_citations,
+            min_year=min_year,
+        )
+        return
+    
+    print(f"Starting {len(dois)} DOIs in separate processes...")
+    processes = []
+    
+    for i, doi in enumerate(dois, 1):
+        process = Process(
+            target=run_single_doi_process,
+            args=(
+                doi, db_path, mailto, max_depth, max_total,
+                per_parent_limit, sleep, use_scihub, min_citations, min_year, i
+            )
+        )
+        processes.append(process)
+        process.start()
+        print(f"Started process {i} for DOI: {normalize_doi(doi)}")
+    
+    # Wait for all processes to complete
+    for i, process in enumerate(processes, 1):
+        process.join()
+        print(f"Process {i} completed")
+    
+    print("All processes completed!")
+
+
 def parse_args(argv: List[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Crawl citations (cited_by) starting from a DOI, download PDFs to S3, and store metadata.")
-    p.add_argument("--doi", required=True, help="Seed DOI or URL, e.g., 10.1038/s41586-020-2649-2 or https://doi.org/...")
-    p.add_argument("--db", default=os.path.abspath("./articles.db"), help="Path to SQLite database file")
+    p = argparse.ArgumentParser(description="Crawl citations starting from one or more DOIs, download PDFs to S3, and store metadata.")
+    p.add_argument("--doi", nargs='+', required=True, help="One or more seed DOIs or URLs, space-separated")
+    p.add_argument("--db", default=os.path.abspath("./articles.db"), help="Path to SQLite database file (process ID will be added for multiple DOIs)")
     p.add_argument("--mailto", default=None, help="Email for OpenAlex polite usage header")
-    p.add_argument("--max-depth", type=int, default=1, help="BFS depth (0=only seed, 1=seed + direct citers)")
-    p.add_argument("--max-total", type=int, default=None, help="Max total articles to process in this run")
-    p.add_argument("--per-parent-limit", type=int, default=50, help="Max citing papers to fetch per parent")
+    p.add_argument("--max-depth", type=int, default=1, help="BFS depth (0=only seed, 1=seed + direct references)")
+    p.add_argument("--max-total", type=int, default=None, help="Max total articles to process per DOI")
+    p.add_argument("--per-parent-limit", type=int, default=50, help="Max references to fetch per parent")
     p.add_argument("--min-citations", type=int, default=0, help="Skip children with cited_by_count below this threshold")
-    p.add_argument("--min-year", type=int, default=None, help="Skip children published before this year (also skips if year is unknown)")
+    p.add_argument("--min-year", type=int, default=None, help="Skip children published before this year")
     p.add_argument("--sleep", type=float, default=1.0, help="Pause between requests (seconds)")
     p.add_argument("--no-scihub", action="store_true", help="Disable Sci-Hub fallback")
     return p.parse_args(argv)
@@ -624,18 +724,24 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
 def main(argv: List[str]) -> None:
     args = parse_args(argv)
 
-    print(
-        f"Starting crawl from DOI={normalize_doi(args.doi)}, depth={args.max_depth}, per_parent_limit={args.per_parent_limit}, max_total={args.max_total}"
-    )
+    print(f"Starting crawl for {len(args.doi)} DOI(s):")
+    for i, doi in enumerate(args.doi, 1):
+        print(f"  {i}. {normalize_doi(doi)}")
+    
+    print(f"Parameters: max_depth={args.max_depth}, per_parent_limit={args.per_parent_limit}, max_total={args.max_total}")
+    print(f"Filters: min_citations={args.min_citations}, min_year={args.min_year}")
+    
+    if len(args.doi) > 1:
+        print(f"Each DOI will run in a separate process with its own database")
 
-    bfs_crawl(
-        seed_doi=args.doi,
+    run_multiple_dois_multiprocess(
+        dois=args.doi,
         db_path=args.db,
         mailto=args.mailto,
         max_depth=args.max_depth,
         max_total=args.max_total,
         per_parent_limit=args.per_parent_limit,
-        request_pause_s=args.sleep,
+        sleep=args.sleep,
         use_scihub=not args.no_scihub,
         min_citations=args.min_citations,
         min_year=args.min_year,

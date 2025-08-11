@@ -82,6 +82,7 @@ pip install requests boto3 python-dotenv scihub
 
 ## Пример запуска
 
+### Обработка одной статьи:
 ```bash
 python main.py \
     --doi "10.1038/s41586-020-2649-2" \
@@ -90,11 +91,23 @@ python main.py \
     --per-parent-limit 10
 ```
 
+### Параллельная обработка нескольких статей в отдельных процессах:
+```bash
+python main.py \
+    --doi "10.1038/s41586-020-2649-2" "10.1038/srep37043" "10.1126/science.abc123" \
+    --mailto "your.email@example.com" \
+    --max-depth 1 \
+    --per-parent-limit 5 \
+    --min-citations 10 \
+    --min-year 2015
+```
+
 При запуске скрипт:
-1. Получит заголовок статьи с DOI `10.1038/s41586-020-2649-2`
-2. Создаст безопасное имя папки (например, `Quantum_Computing_Breakthrough_in_Machine_Learning`)
-3. Сохранит все найденные PDF в эту папку в S3: `palladium-articles/Quantum_Computing_Breakthrough_in_Machine_Learning/`
-4. В локальной БД будут сохранены полные S3 пути к файлам
+1. Получит заголовки всех указанных статей
+2. Создаст отдельную папку для каждой статьи (например, `Quantum_Computing_Breakthrough_in_Machine_Learning`)
+3. **Запустит каждую статью в отдельном процессе** с собственной базой данных
+4. Сохранит все найденные PDF в соответствующие папки в S3: `palladium-articles/[название_статьи]/`
+5. Каждый процесс создаст свою БД: `articles_process_1.db`, `articles_process_2.db`, и т.д.
 
 ## Хранение данных
 
@@ -114,6 +127,9 @@ python main.py \
 ```bash
 # Открыть базу данных
 sqlite3 articles.db
+
+# Для множественных процессов - открыть конкретную БД
+sqlite3 articles_process_1.db
 
 # Посмотреть структуру таблиц
 .schema
