@@ -103,4 +103,61 @@ python main.py \
   - Название папки автоматически очищается от недопустимых символов
   - Пример структуры: `palladium-articles/Deep_Learning_Approach_to_Pattern_Recognition/article1.pdf`
 - **Метаданные**: Сохраняются в локальную SQLite базу данных (по умолчанию `./articles.db`)
-- **S3 ключи**: В базе данных сохраняются полные S3 пути включая папку (например, `folder_name/article.pdf`) 
+- **S3 ключи**: В базе данных сохраняются полные S3 пути включая папку (например, `folder_name/article.pdf`)
+
+## Работа с базой данных SQLite
+
+Для просмотра собранных данных используйте команды SQLite:
+
+### Основные запросы для просмотра данных
+
+```bash
+# Открыть базу данных
+sqlite3 articles.db
+
+# Посмотреть структуру таблиц
+.schema
+
+# Количество статей и связей
+SELECT COUNT(*) as total_articles FROM articles;
+SELECT COUNT(*) as total_relations FROM relations;
+
+# Показать первые 10 статей с их метаданными
+SELECT doi, title, year, cited_by_count, distance FROM articles LIMIT 10;
+
+# Статьи по глубине обнаружения
+SELECT distance, COUNT(*) as count FROM articles GROUP BY distance ORDER BY distance;
+
+# Статьи с самой высокой цитируемостью
+SELECT title, doi, cited_by_count, year FROM articles ORDER BY cited_by_count DESC LIMIT 10;
+
+# Посмотреть связи между статьями
+SELECT a1.title as from_title, a2.title as to_title, r.relation 
+FROM relations r 
+JOIN articles a1 ON r.from_doi = a1.doi 
+JOIN articles a2 ON r.to_doi = a2.doi 
+LIMIT 10;
+
+# Статьи с успешно скачанными PDF
+SELECT title, pdf_path, source_pdf FROM articles WHERE pdf_path IS NOT NULL LIMIT 10;
+
+# Статистика по источникам PDF
+SELECT source_pdf, COUNT(*) as count FROM articles WHERE source_pdf IS NOT NULL GROUP BY source_pdf;
+
+# Выйти из SQLite
+.quit
+```
+
+### Полезные команды для анализа
+
+```bash
+# Экспорт данных в CSV
+sqlite3 articles.db -header -csv "SELECT * FROM articles;" > articles.csv
+sqlite3 articles.db -header -csv "SELECT * FROM relations;" > relations.csv
+
+# Поиск статей по ключевым словам в заголовке
+sqlite3 articles.db "SELECT title, doi, year FROM articles WHERE title LIKE '%machine learning%';"
+
+# Найти самые цитируемые статьи по годам
+sqlite3 articles.db "SELECT year, MAX(cited_by_count) as max_citations, title FROM articles WHERE year IS NOT NULL GROUP BY year ORDER BY year DESC;"
+``` 
