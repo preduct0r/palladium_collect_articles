@@ -119,6 +119,7 @@ def init_db(db_path: str) -> sqlite3.Connection:
             source_pdf TEXT,
             distance INTEGER,
             found_from_doi TEXT,
+            seed_article_title TEXT,
             created_at TEXT DEFAULT (datetime('now')),
             updated_at TEXT
         );
@@ -155,6 +156,7 @@ def upsert_article(
     meta: ArticleMeta,
     distance: Optional[int],
     found_from_doi: Optional[str],
+    seed_article_title: Optional[str] = None,
     pdf_url: Optional[str] = None,
     pdf_path: Optional[str] = None,
     source_pdf: Optional[str] = None,
@@ -163,8 +165,8 @@ def upsert_article(
         """
         INSERT INTO articles (
             doi, openalex_id, title, year, is_open_access, oa_status,
-            cited_by_count, pdf_url, pdf_path, source_pdf, distance, found_from_doi, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            cited_by_count, pdf_url, pdf_path, source_pdf, distance, found_from_doi, seed_article_title, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(doi) DO UPDATE SET
             openalex_id=excluded.openalex_id,
             title=COALESCE(excluded.title, articles.title),
@@ -177,6 +179,7 @@ def upsert_article(
             source_pdf=COALESCE(excluded.source_pdf, articles.source_pdf),
             distance=COALESCE(articles.distance, excluded.distance),
             found_from_doi=COALESCE(articles.found_from_doi, excluded.found_from_doi),
+            seed_article_title=COALESCE(articles.seed_article_title, excluded.seed_article_title),
             updated_at=excluded.updated_at
         ;
         """,
@@ -193,6 +196,7 @@ def upsert_article(
             source_pdf,
             distance,
             found_from_doi,
+            seed_article_title,
             now_iso(),
             now_iso(),
         ),
@@ -458,6 +462,7 @@ def process_article(
     distance: int,
     s3_client: Optional[boto3.client],
     folder_name: str,
+    seed_article_title: str,
     mailto: Optional[str],
     per_parent_limit: int,
     request_pause_s: float,
@@ -494,6 +499,7 @@ def process_article(
         meta,
         distance=distance,
         found_from_doi=parent_doi,
+        seed_article_title=seed_article_title,
         pdf_url=pdf_url_used,
         pdf_path=s3_key,  # This now contains the S3 key instead of local path
         source_pdf=source_pdf,
@@ -527,12 +533,12 @@ def process_article(
 
         # Ensure child row exists and capture discovery depth/found_from
         if not article_exists(conn, child_doi):
-            upsert_article(conn, child_meta, distance=child_distance, found_from_doi=norm_doi)
+            upsert_article(conn, child_meta, distance=child_distance, found_from_doi=norm_doi, seed_article_title=seed_article_title)
             children_dois.append(child_doi)
             debug_stats["added_to_queue"] += 1
         else:
             # Fill missing distance/found_from_doi if not set
-            upsert_article(conn, child_meta, distance=child_distance, found_from_doi=norm_doi)
+            upsert_article(conn, child_meta, distance=child_distance, found_from_doi=norm_doi, seed_article_title=seed_article_title)
             debug_stats["already_exists"] += 1
 
         # Now relation can be recorded (FK-safe)
@@ -557,14 +563,16 @@ def bfs_crawl(
     conn = init_db(db_path)
     s3_client = init_s3_client()
 
-    # Get seed article title for folder name
+    # Get seed article title for folder name and tracking
     seed_norm = normalize_doi(seed_doi)
     seed_work = get_openalex_work_by_doi(seed_norm, mailto)
     if seed_work:
         seed_meta = extract_meta_from_openalex(seed_work, seed_norm)
         folder_name = safe_folder_name_from_title(seed_meta.title)
+        seed_article_title = seed_meta.title or seed_norm
     else:
         folder_name = safe_folder_name_from_title(seed_norm)
+        seed_article_title = seed_norm
     
     print(f"PDFs will be saved to S3 folder: {folder_name}")
 
@@ -591,6 +599,7 @@ def bfs_crawl(
                 distance=dist,
                 s3_client=s3_client,
                 folder_name=folder_name,
+                seed_article_title=seed_article_title,
                 mailto=mailto,
                 per_parent_limit=per_parent_limit,
                 request_pause_s=request_pause_s,
@@ -632,13 +641,10 @@ def run_single_doi_process(
     try:
         print(f"[Process {process_id}] Starting crawl for DOI: {normalize_doi(doi)}")
         
-        # Create process-specific database to avoid conflicts
-        base_name = os.path.splitext(db_path)[0]
-        process_db_path = f"{base_name}_process_{process_id}.db"
-        
+        # Use shared database (SQLite WAL mode supports concurrent writes)
         bfs_crawl(
             seed_doi=doi,
-            db_path=process_db_path,
+            db_path=db_path,  # Use the same database for all processes
             mailto=mailto,
             max_depth=max_depth,
             max_total=max_total,
@@ -732,7 +738,7 @@ def main(argv: List[str]) -> None:
     print(f"Filters: min_citations={args.min_citations}, min_year={args.min_year}")
     
     if len(args.doi) > 1:
-        print(f"Each DOI will run in a separate process with its own database")
+        print(f"Each DOI will run in a separate process with shared database")
 
     run_multiple_dois_multiprocess(
         dois=args.doi,

@@ -105,9 +105,24 @@ python main.py \
 При запуске скрипт:
 1. Получит заголовки всех указанных статей
 2. Создаст отдельную папку для каждой статьи (например, `Quantum_Computing_Breakthrough_in_Machine_Learning`)
-3. **Запустит каждую статью в отдельном процессе** с собственной базой данных
+3. **Запустит каждую статью в отдельном процессе** с общей базой данных
 4. Сохранит все найденные PDF в соответствующие папки в S3: `palladium-articles/[название_статьи]/`
-5. Каждый процесс создаст свою БД: `articles_process_1.db`, `articles_process_2.db`, и т.д.
+5. Все статьи будут в одной БД `articles.db`, но с полем `seed_article_title` для разделения по источникам
+
+### 6. Параллельная обработка
+
+При указании нескольких DOI скрипт автоматически использует многопроцессорность:
+
+- **Каждый DOI обрабатывается в отдельном процессе**
+- **Каждая статья создает свою собственную папку в S3**
+- **Все процессы используют одну общую базу данных** (SQLite WAL mode поддерживает параллельную запись)
+- **Статьи разделяются по полю `seed_article_title`** в базе данных
+
+Преимущества параллельной обработки:
+- Значительное сокращение времени выполнения при обработке нескольких статей
+- Эффективное использование сетевых ресурсов
+- Возможность обработки больших объемов данных
+- **Единая база данных** для удобного анализа всех собранных данных
 
 ## Хранение данных
 
@@ -115,7 +130,8 @@ python main.py \
   - Все PDF файлы сохраняются в папку, названную по заголовку исходной (seed) статьи
   - Название папки автоматически очищается от недопустимых символов
   - Пример структуры: `palladium-articles/Deep_Learning_Approach_to_Pattern_Recognition/article1.pdf`
-- **Метаданные**: Сохраняются в локальную SQLite базу данных (по умолчанию `./articles.db`)
+- **Метаданные**: Сохраняются в единую SQLite базу данных (по умолчанию `./articles.db`)
+- **Разделение по источникам**: Поле `seed_article_title` показывает, из какой исходной статьи была найдена каждая запись
 - **S3 ключи**: В базе данных сохраняются полные S3 пути включая папку (например, `folder_name/article.pdf`)
 
 ## Работа с базой данных SQLite
@@ -128,9 +144,6 @@ python main.py \
 # Открыть базу данных
 sqlite3 articles.db
 
-# Для множественных процессов - открыть конкретную БД
-sqlite3 articles_process_1.db
-
 # Посмотреть структуру таблиц
 .schema
 
@@ -139,41 +152,13 @@ SELECT COUNT(*) as total_articles FROM articles;
 SELECT COUNT(*) as total_relations FROM relations;
 
 # Показать первые 10 статей с их метаданными
-SELECT doi, title, year, cited_by_count, distance FROM articles LIMIT 10;
+SELECT doi, title, year, cited_by_count, distance, seed_article_title FROM articles LIMIT 10;
 
-# Статьи по глубине обнаружения
-SELECT distance, COUNT(*) as count FROM articles GROUP BY distance ORDER BY distance;
+# Статьи по исходной статье (seed)
+SELECT seed_article_title, COUNT(*) as count FROM articles GROUP BY seed_article_title;
 
-# Статьи с самой высокой цитируемостью
-SELECT title, doi, cited_by_count, year FROM articles ORDER BY cited_by_count DESC LIMIT 10;
-
-# Посмотреть связи между статьями
-SELECT a1.title as from_title, a2.title as to_title, r.relation 
-FROM relations r 
-JOIN articles a1 ON r.from_doi = a1.doi 
-JOIN articles a2 ON r.to_doi = a2.doi 
-LIMIT 10;
-
-# Статьи с успешно скачанными PDF
-SELECT title, pdf_path, source_pdf FROM articles WHERE pdf_path IS NOT NULL LIMIT 10;
-
-# Статистика по источникам PDF
-SELECT source_pdf, COUNT(*) as count FROM articles WHERE source_pdf IS NOT NULL GROUP BY source_pdf;
-
-# Выйти из SQLite
-.quit
-```
-
-### Полезные команды для анализа
-
-```bash
-# Экспорт данных в CSV
-sqlite3 articles.db -header -csv "SELECT * FROM articles;" > articles.csv
-sqlite3 articles.db -header -csv "SELECT * FROM relations;" > relations.csv
-
-# Поиск статей по ключевым словам в заголовке
-sqlite3 articles.db "SELECT title, doi, year FROM articles WHERE title LIKE '%machine learning%';"
-
-# Найти самые цитируемые статьи по годам
-sqlite3 articles.db "SELECT year, MAX(cited_by_count) as max_citations, title FROM articles WHERE year IS NOT NULL GROUP BY year ORDER BY year DESC;"
+# Статьи по глубине обнаружения для конкретной исходной статьи
+SELECT distance, COUNT(*) as count FROM articles 
+WHERE seed_article_title LIKE '%ваш_поисковый_термин%' 
+GROUP BY distance ORDER BY distance;
 ``` 
