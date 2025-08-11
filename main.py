@@ -226,6 +226,52 @@ def get_openalex_work_by_doi(doi: str, mailto: Optional[str]) -> Optional[Dict]:
         return None
 
 
+def get_openalex_work_by_openalex_id(openalex_id_or_url: str, mailto: Optional[str]) -> Optional[Dict]:
+    """Fetch OpenAlex work by its OpenAlex ID or full URL like https://openalex.org/Wxxxxxx."""
+    if not openalex_id_or_url:
+        return None
+    oid = openalex_id_or_url.strip()
+    # Accept full URL or bare ID
+    if oid.startswith("http"):
+        oid = oid.rstrip("/").split("/")[-1]
+    url = f"{OPENALEX_BASE_URL}/works/{oid}"
+    params = {}
+    if mailto:
+        params["mailto"] = mailto
+    try:
+        resp = requests.get(url, headers=build_headers(mailto), params=params, timeout=20)
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+    except Exception:
+        return None
+
+
+def iter_references_for_doi(
+    doi: str,
+    mailto: Optional[str],
+    per_parent_limit: int,
+    request_pause_s: float,
+) -> Generator[Dict, None, None]:
+    """Yield referenced works (the papers this work references)."""
+    work = get_openalex_work_by_doi(doi, mailto)
+    if not work:
+        return
+    refs = work.get("referenced_works") or []
+    if not isinstance(refs, list) or not refs:
+        return
+
+    count_yielded = 0
+    for ref in refs:
+        if count_yielded >= per_parent_limit:
+            break
+        child_work = get_openalex_work_by_openalex_id(ref, mailto)
+        if child_work:
+            yield child_work
+            count_yielded += 1
+            time.sleep(request_pause_s)
+
+
 def extract_meta_from_openalex(work: Dict, fallback_doi: Optional[str]) -> ArticleMeta:
     def safe_get(d: Dict, path: List[str]) -> Optional[object]:
         cur = d
@@ -266,45 +312,6 @@ def extract_meta_from_openalex(work: Dict, fallback_doi: Optional[str]) -> Artic
         best_pdf_url=best_pdf,
         cited_by_count=int(cited_by_count) if isinstance(cited_by_count, int) else None,
     )
-
-
-def iter_citations_for_doi(
-    doi: str,
-    mailto: Optional[str],
-    per_parent_limit: int,
-    request_pause_s: float,
-) -> Generator[Dict, None, None]:
-    work = get_openalex_work_by_doi(doi, mailto)
-    if not work:
-        return
-    cited_by_url = work.get("cited_by_api_url")
-    if not cited_by_url:
-        return
-
-    params = {"per_page": min(200, max(25, per_parent_limit))}
-    if mailto:
-        params["mailto"] = mailto
-
-    count_yielded = 0
-    next_url = cited_by_url
-
-    while next_url and count_yielded < per_parent_limit:
-        try:
-            resp = requests.get(next_url, headers=build_headers(mailto), params=params, timeout=30)
-            if resp.status_code != 200:
-                break
-            data = resp.json()
-            results = data.get("results", [])
-            for item in results:
-                if count_yielded >= per_parent_limit:
-                    break
-                yield item
-                count_yielded += 1
-            next_url = data.get("meta", {}).get("next_url")
-            if next_url:
-                time.sleep(request_pause_s)
-        except Exception:
-            break
 
 
 def safe_folder_name_from_title(title: str) -> str:
@@ -451,7 +458,7 @@ def process_article(
 
     # Explore citations (i.e., papers that cite this one)
     children_dois: List[str] = []
-    for item in iter_citations_for_doi(norm_doi, mailto, per_parent_limit, request_pause_s):
+    for item in iter_references_for_doi(norm_doi, mailto, per_parent_limit, request_pause_s):
         child_meta = extract_meta_from_openalex(item, None)
         child_doi = child_meta.doi
         if not child_doi:
@@ -459,7 +466,7 @@ def process_article(
         children_dois.append(child_doi)
         # Upsert minimal child row (distance assigned when processed in BFS)
         upsert_article(conn, child_meta, distance=None, found_from_doi=None)
-        insert_relation(conn, from_doi=norm_doi, to_doi=child_doi, relation="cited_by")
+        insert_relation(conn, from_doi=norm_doi, to_doi=child_doi, relation="references")
 
     return children_dois
 
