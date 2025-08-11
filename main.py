@@ -410,6 +410,15 @@ def try_download_pdf_for_article(
     return (None, None, None)
 
 
+def article_exists(conn: sqlite3.Connection, doi: str) -> bool:
+    """Return True if an article with the given DOI already exists in the DB."""
+    try:
+        cur = conn.execute("SELECT 1 FROM articles WHERE doi = ? LIMIT 1;", (doi,))
+        return cur.fetchone() is not None
+    except sqlite3.Error:
+        return False
+
+
 def process_article(
     conn: sqlite3.Connection,
     doi: str,
@@ -421,6 +430,7 @@ def process_article(
     per_parent_limit: int,
     request_pause_s: float,
     use_scihub: bool,
+    min_citations: int,
 ) -> List[str]:
     norm_doi = normalize_doi(doi)
 
@@ -456,18 +466,26 @@ def process_article(
         source_pdf=source_pdf,
     )
 
-    # Explore citations (i.e., papers that cite this one)
+    # Explore references (i.e., papers this one references)
     children_dois: List[str] = []
     for item in iter_references_for_doi(norm_doi, mailto, per_parent_limit, request_pause_s):
         child_meta = extract_meta_from_openalex(item, None)
         child_doi = child_meta.doi
         if not child_doi:
             continue  # skip if no DOI
-        children_dois.append(child_doi)
-        # Upsert minimal child row (distance assigned when processed in BFS)
-        upsert_article(conn, child_meta, distance=None, found_from_doi=None)
+        # Filter by citation threshold
+        child_citations = child_meta.cited_by_count if child_meta.cited_by_count is not None else 0
+        if child_citations < min_citations:
+            continue
+        # Ensure child exists in DB if we want to record the relation
+        newly_inserted = False
+        if not article_exists(conn, child_doi):
+            upsert_article(conn, child_meta, distance=None, found_from_doi=None)
+            newly_inserted = True
+            children_dois.append(child_doi)
+        # Now relation can be recorded (FK-safe)
         insert_relation(conn, from_doi=norm_doi, to_doi=child_doi, relation="references")
-
+ 
     return children_dois
 
 
@@ -480,6 +498,7 @@ def bfs_crawl(
     per_parent_limit: int,
     request_pause_s: float,
     use_scihub: bool,
+    min_citations: int,
 ) -> None:
     conn = init_db(db_path)
     s3_client = init_s3_client()
@@ -522,6 +541,7 @@ def bfs_crawl(
                 per_parent_limit=per_parent_limit,
                 request_pause_s=request_pause_s,
                 use_scihub=use_scihub,
+                min_citations=min_citations,
             )
         except Exception as e:
             print(f"Error processing {doi}: {e}")
@@ -548,6 +568,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--max-depth", type=int, default=1, help="BFS depth (0=only seed, 1=seed + direct citers)")
     p.add_argument("--max-total", type=int, default=None, help="Max total articles to process in this run")
     p.add_argument("--per-parent-limit", type=int, default=50, help="Max citing papers to fetch per parent")
+    p.add_argument("--min-citations", type=int, default=0, help="Skip children with cited_by_count below this threshold")
     p.add_argument("--sleep", type=float, default=1.0, help="Pause between requests (seconds)")
     p.add_argument("--no-scihub", action="store_true", help="Disable Sci-Hub fallback")
     return p.parse_args(argv)
@@ -569,6 +590,7 @@ def main(argv: List[str]) -> None:
         per_parent_limit=args.per_parent_limit,
         request_pause_s=args.sleep,
         use_scihub=not args.no_scihub,
+        min_citations=args.min_citations,
     )
 
     print("Done.")
