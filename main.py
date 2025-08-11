@@ -253,6 +253,52 @@ def get_openalex_work_by_doi(doi: str, mailto: Optional[str]) -> Optional[Dict]:
         return None
 
 
+def get_openalex_work_by_openalex_id(openalex_id_or_url: str, mailto: Optional[str]) -> Optional[Dict]:
+    """Fetch OpenAlex work by its OpenAlex ID or full URL like https://openalex.org/Wxxxxxx."""
+    if not openalex_id_or_url:
+        return None
+    oid = openalex_id_or_url.strip()
+    # Accept full URL or bare ID
+    if oid.startswith("http"):
+        oid = oid.rstrip("/").split("/")[-1]
+    url = f"{OPENALEX_BASE_URL}/works/{oid}"
+    params = {}
+    if mailto:
+        params["mailto"] = mailto
+    try:
+        resp = requests.get(url, headers=build_headers(mailto), params=params, timeout=20)
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+    except Exception:
+        return None
+
+
+def iter_references_for_doi(
+    doi: str,
+    mailto: Optional[str],
+    per_parent_limit: int,
+    request_pause_s: float,
+) -> Generator[Dict, None, None]:
+    """Yield referenced works (the papers this work references)."""
+    work = get_openalex_work_by_doi(doi, mailto)
+    if not work:
+        return
+    refs = work.get("referenced_works") or []
+    if not isinstance(refs, list) or not refs:
+        return
+
+    count_yielded = 0
+    for ref in refs:
+        if count_yielded >= per_parent_limit:
+            break
+        child_work = get_openalex_work_by_openalex_id(ref, mailto)
+        if child_work:
+            yield child_work
+            count_yielded += 1
+            time.sleep(request_pause_s)
+
+
 def extract_meta_from_openalex(work: Dict, fallback_doi: Optional[str]) -> ArticleMeta:
     def safe_get(d: Dict, path: List[str]) -> Optional[object]:
         cur = d
@@ -295,45 +341,6 @@ def extract_meta_from_openalex(work: Dict, fallback_doi: Optional[str]) -> Artic
     )
 
 
-def iter_citations_for_doi(
-    doi: str,
-    mailto: Optional[str],
-    per_parent_limit: int,
-    request_pause_s: float,
-) -> Generator[Dict, None, None]:
-    work = get_openalex_work_by_doi(doi, mailto)
-    if not work:
-        return
-    cited_by_url = work.get("cited_by_api_url")
-    if not cited_by_url:
-        return
-
-    params = {"per_page": min(200, max(25, per_parent_limit))}
-    if mailto:
-        params["mailto"] = mailto
-
-    count_yielded = 0
-    next_url = cited_by_url
-
-    while next_url and count_yielded < per_parent_limit:
-        try:
-            resp = requests.get(next_url, headers=build_headers(mailto), params=params, timeout=30)
-            if resp.status_code != 200:
-                break
-            data = resp.json()
-            results = data.get("results", [])
-            for item in results:
-                if count_yielded >= per_parent_limit:
-                    break
-                yield item
-                count_yielded += 1
-            next_url = data.get("meta", {}).get("next_url")
-            if next_url:
-                time.sleep(request_pause_s)
-        except Exception:
-            break
-
-
 def safe_folder_name_from_title(title: str) -> str:
     """Create a safe folder name from article title."""
     if not title:
@@ -365,12 +372,27 @@ def download_pdf_to_s3(url: str, s3_client: Optional[boto3.client], s3_key: str,
     if not s3_client:
         return False
     
+    # Better headers for academic publishers
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'application/pdf,*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1'
+    }
+    
     try:
-        with requests.get(url, stream=True, timeout=60, verify=verify_tls) as r:
-            if r.status_code != 200 or "pdf" not in (r.headers.get("Content-Type") or "").lower():
-                # Even if content-type not pdf, try saving based on URL ending
-                if not url.lower().endswith(".pdf") and r.status_code != 200:
-                    return False
+        with requests.get(url, stream=True, timeout=60, verify=verify_tls, headers=headers) as r:
+            # More lenient check: if URL looks like PDF or status is OK, try to download
+            is_pdf_url = url.lower().endswith('.pdf') or 'pdf' in url.lower()
+            has_pdf_content = "pdf" in (r.headers.get("Content-Type") or "").lower()
+            
+            if r.status_code != 200:
+                return False
+                
+            # If URL suggests PDF or content-type is PDF, proceed
+            if not (is_pdf_url or has_pdf_content):
+                return False
             
             # Collect all content in memory
             content = b''
@@ -378,8 +400,16 @@ def download_pdf_to_s3(url: str, s3_client: Optional[boto3.client], s3_key: str,
                 if chunk:
                     content += chunk
             
-            # Upload to S3
-            return upload_content_to_s3(s3_client, content, s3_key)
+            # Quick check: does content start with PDF magic bytes?
+            if len(content) >= 4 and content[:4] == b'%PDF':
+                # Upload to S3
+                return upload_content_to_s3(s3_client, content, s3_key)
+            elif is_pdf_url and len(content) > 1000:
+                # If URL suggests PDF and we got substantial content, try anyway
+                return upload_content_to_s3(s3_client, content, s3_key)
+            else:
+                return False
+                
     except Exception as e:
         print(f"Error downloading PDF from {url}: {e}")
         return False
@@ -430,6 +460,15 @@ def try_download_pdf_for_article(
     return (None, None, None)
 
 
+def article_exists(conn: sqlite3.Connection, doi: str) -> bool:
+    """Return True if an article with the given DOI already exists in the DB."""
+    try:
+        cur = conn.execute("SELECT 1 FROM articles WHERE doi = ? LIMIT 1;", (doi,))
+        return cur.fetchone() is not None
+    except sqlite3.Error:
+        return False
+
+
 def process_article(
     conn: sqlite3.Connection,
     doi: str,
@@ -441,6 +480,8 @@ def process_article(
     per_parent_limit: int,
     request_pause_s: float,
     use_scihub: bool,
+    min_citations: int,
+    min_year: Optional[int],
 ) -> List[str]:
     norm_doi = normalize_doi(doi)
 
@@ -476,18 +517,46 @@ def process_article(
         source_pdf=source_pdf,
     )
 
-    # Explore citations (i.e., papers that cite this one)
+    # Explore references (i.e., papers this one references)
     children_dois: List[str] = []
-    for item in iter_citations_for_doi(norm_doi, mailto, per_parent_limit, request_pause_s):
+    debug_stats = {"total_refs": 0, "with_doi": 0, "passed_year": 0, "passed_citations": 0, "already_exists": 0, "added_to_queue": 0}
+    
+    for item in iter_references_for_doi(norm_doi, mailto, per_parent_limit, request_pause_s):
+        debug_stats["total_refs"] += 1
         child_meta = extract_meta_from_openalex(item, None)
         child_doi = child_meta.doi
         if not child_doi:
             continue  # skip if no DOI
-        children_dois.append(child_doi)
-        # Upsert minimal child row (distance assigned when processed in BFS)
-        upsert_article(conn, child_meta, distance=None, found_from_doi=None)
-        insert_relation(conn, from_doi=norm_doi, to_doi=child_doi, relation="cited_by")
+        debug_stats["with_doi"] += 1
+        
+        # Filter by publication year
+        if min_year is not None:
+            if child_meta.year is None or child_meta.year < min_year:
+                continue
+        debug_stats["passed_year"] += 1
+        
+        # Filter by citation threshold
+        child_citations = child_meta.cited_by_count if child_meta.cited_by_count is not None else 0
+        if child_citations < min_citations:
+            continue
+        debug_stats["passed_citations"] += 1
 
+        child_distance = (distance + 1) if distance is not None else None
+
+        # Ensure child row exists and capture discovery depth/found_from
+        if not article_exists(conn, child_doi):
+            upsert_article(conn, child_meta, distance=child_distance, found_from_doi=norm_doi)
+            children_dois.append(child_doi)
+            debug_stats["added_to_queue"] += 1
+        else:
+            # Fill missing distance/found_from_doi if not set
+            upsert_article(conn, child_meta, distance=child_distance, found_from_doi=norm_doi)
+            debug_stats["already_exists"] += 1
+
+        # Now relation can be recorded (FK-safe)
+        insert_relation(conn, from_doi=norm_doi, to_doi=child_doi, relation="references")
+ 
+    print(f"DOI {norm_doi}: refs={debug_stats['total_refs']}, with_doi={debug_stats['with_doi']}, passed_filters={debug_stats['passed_citations']}, new={debug_stats['added_to_queue']}, existing={debug_stats['already_exists']}")
     return children_dois
 
 
@@ -655,6 +724,8 @@ def bfs_crawl(
     per_parent_limit: int,
     request_pause_s: float,
     use_scihub: bool,
+    min_citations: int,
+    min_year: Optional[int],
 ) -> None:
     conn = init_db(db_path)
     s3_client = init_s3_client()
@@ -697,6 +768,8 @@ def bfs_crawl(
                 per_parent_limit=per_parent_limit,
                 request_pause_s=request_pause_s,
                 use_scihub=use_scihub,
+                min_citations=min_citations,
+                min_year=min_year,
             )
         except Exception as e:
             print(f"Error processing {doi}: {e}")
@@ -723,6 +796,8 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--max-depth", type=int, default=1, help="Default BFS depth for DOIs without explicit depth (0=only seed, 1=seed + direct citers)")
     p.add_argument("--max-total", type=int, default=None, help="Max total articles to process in this run per DOI")
     p.add_argument("--per-parent-limit", type=int, default=50, help="Max citing papers to fetch per parent")
+    p.add_argument("--min-citations", type=int, default=0, help="Skip children with cited_by_count below this threshold")
+    p.add_argument("--min-year", type=int, default=None, help="Skip children published before this year (also skips if year is unknown)")
     p.add_argument("--sleep", type=float, default=1.0, help="Pause between requests (seconds)")
     p.add_argument("--no-scihub", action="store_true", help="Disable Sci-Hub fallback")
     p.add_argument("--max-workers", type=int, default=3, help="Maximum number of parallel workers for processing multiple DOIs")
@@ -752,7 +827,9 @@ def main(argv: List[str]) -> None:
         per_parent_limit=args.per_parent_limit,
         request_pause_s=args.sleep,
         use_scihub=not args.no_scihub,
-        max_workers=args.max_workers,
+        min_citations=args.min_citations,
+        min_year=args.min_year,
+
     )
 
     # Print summary

@@ -62,7 +62,7 @@ def search_with_direct_url(doi):
                         'mirror': mirror
                     }
         except Exception as e:
-            print(f"   Error with mirror {mirror}: {e}")
+            # print(f"   Error with mirror {mirror}: {e}")
             continue
     
     return None  # Return None when not found, like in original version
