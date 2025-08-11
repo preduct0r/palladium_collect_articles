@@ -345,12 +345,27 @@ def download_pdf_to_s3(url: str, s3_client: Optional[boto3.client], s3_key: str,
     if not s3_client:
         return False
     
+    # Better headers for academic publishers
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'application/pdf,*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1'
+    }
+    
     try:
-        with requests.get(url, stream=True, timeout=60, verify=verify_tls) as r:
-            if r.status_code != 200 or "pdf" not in (r.headers.get("Content-Type") or "").lower():
-                # Even if content-type not pdf, try saving based on URL ending
-                if not url.lower().endswith(".pdf") and r.status_code != 200:
-                    return False
+        with requests.get(url, stream=True, timeout=60, verify=verify_tls, headers=headers) as r:
+            # More lenient check: if URL looks like PDF or status is OK, try to download
+            is_pdf_url = url.lower().endswith('.pdf') or 'pdf' in url.lower()
+            has_pdf_content = "pdf" in (r.headers.get("Content-Type") or "").lower()
+            
+            if r.status_code != 200:
+                return False
+                
+            # If URL suggests PDF or content-type is PDF, proceed
+            if not (is_pdf_url or has_pdf_content):
+                return False
             
             # Collect all content in memory
             content = b''
@@ -358,8 +373,16 @@ def download_pdf_to_s3(url: str, s3_client: Optional[boto3.client], s3_key: str,
                 if chunk:
                     content += chunk
             
-            # Upload to S3
-            return upload_content_to_s3(s3_client, content, s3_key)
+            # Quick check: does content start with PDF magic bytes?
+            if len(content) >= 4 and content[:4] == b'%PDF':
+                # Upload to S3
+                return upload_content_to_s3(s3_client, content, s3_key)
+            elif is_pdf_url and len(content) > 1000:
+                # If URL suggests PDF and we got substantial content, try anyway
+                return upload_content_to_s3(s3_client, content, s3_key)
+            else:
+                return False
+                
     except Exception as e:
         print(f"Error downloading PDF from {url}: {e}")
         return False
@@ -469,28 +492,44 @@ def process_article(
 
     # Explore references (i.e., papers this one references)
     children_dois: List[str] = []
+    debug_stats = {"total_refs": 0, "with_doi": 0, "passed_year": 0, "passed_citations": 0, "already_exists": 0, "added_to_queue": 0}
+    
     for item in iter_references_for_doi(norm_doi, mailto, per_parent_limit, request_pause_s):
+        debug_stats["total_refs"] += 1
         child_meta = extract_meta_from_openalex(item, None)
         child_doi = child_meta.doi
         if not child_doi:
             continue  # skip if no DOI
+        debug_stats["with_doi"] += 1
+        
         # Filter by publication year
         if min_year is not None:
             if child_meta.year is None or child_meta.year < min_year:
                 continue
+        debug_stats["passed_year"] += 1
+        
         # Filter by citation threshold
         child_citations = child_meta.cited_by_count if child_meta.cited_by_count is not None else 0
         if child_citations < min_citations:
             continue
-        # Ensure child exists in DB if we want to record the relation
-        newly_inserted = False
+        debug_stats["passed_citations"] += 1
+
+        child_distance = (distance + 1) if distance is not None else None
+
+        # Ensure child row exists and capture discovery depth/found_from
         if not article_exists(conn, child_doi):
-            upsert_article(conn, child_meta, distance=None, found_from_doi=None)
-            newly_inserted = True
+            upsert_article(conn, child_meta, distance=child_distance, found_from_doi=norm_doi)
             children_dois.append(child_doi)
+            debug_stats["added_to_queue"] += 1
+        else:
+            # Fill missing distance/found_from_doi if not set
+            upsert_article(conn, child_meta, distance=child_distance, found_from_doi=norm_doi)
+            debug_stats["already_exists"] += 1
+
         # Now relation can be recorded (FK-safe)
         insert_relation(conn, from_doi=norm_doi, to_doi=child_doi, relation="references")
  
+    print(f"DOI {norm_doi}: refs={debug_stats['total_refs']}, with_doi={debug_stats['with_doi']}, passed_filters={debug_stats['passed_citations']}, new={debug_stats['added_to_queue']}, existing={debug_stats['already_exists']}")
     return children_dois
 
 
