@@ -4,6 +4,8 @@ import tempfile
 import shutil
 import subprocess
 from typing import Optional, Tuple
+import signal
+from contextlib import contextmanager
 
 import boto3
 from botocore.exceptions import ClientError
@@ -24,6 +26,30 @@ S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY")
 
 # Destination bucket for parsed text
 DEST_BUCKET_NAME = os.getenv("P2T_BUCKET_NAME", "palladium-pdf-to-text")
+DEFAULT_STEP_TIMEOUT_SEC = int(os.getenv("PROCESS_STEP_TIMEOUT_SEC") or "600")
+
+
+class TimeoutException(Exception):
+    pass
+
+
+@contextmanager
+def time_limit(seconds: int, desc: str = "operation"):
+    """Abort the current operation if it exceeds the given time budget (Unix-only)."""
+    if seconds is None or seconds <= 0:
+        yield
+        return
+
+    def _handler(signum, frame):
+        raise TimeoutException(f"Timed out after {seconds}s during {desc}")
+
+    old_handler = signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 
 def init_s3_client() -> Optional[boto3.client]:
@@ -73,7 +99,13 @@ def try_ocrmypdf(input_pdf: str) -> Optional[str]:
             input_pdf,
             ocr_pdf,
         ]
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(
+            cmd,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=DEFAULT_STEP_TIMEOUT_SEC,
+        )
         return ocr_pdf if os.path.exists(ocr_pdf) else None
     except Exception:
         return None
@@ -148,7 +180,8 @@ def process_one_pdf(
         ocr_pdf = try_ocrmypdf(local_pdf)
         if ocr_pdf:
             try:
-                text, metadata, images = pdf_to_markdown_local(converter, ocr_pdf)
+                with time_limit(DEFAULT_STEP_TIMEOUT_SEC, desc=f"marker conversion (OCR) for {src_key}"):
+                    text, metadata, images = pdf_to_markdown_local(converter, ocr_pdf)
                 used_ocr = True
                 print(f"OCR applied to {src_key}")
             except Exception as e:
@@ -159,7 +192,8 @@ def process_one_pdf(
     # If OCR wasn't used or failed, try original PDF
     if text is None:
         try:
-            text, metadata, images = pdf_to_markdown_local(converter, local_pdf)
+            with time_limit(DEFAULT_STEP_TIMEOUT_SEC, desc=f"marker conversion (original) for {src_key}"):
+                text, metadata, images = pdf_to_markdown_local(converter, local_pdf)
         except Exception as e:
             print(f"Marker conversion failed for {src_key}: {e}")
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -170,7 +204,8 @@ def process_one_pdf(
         ocr_pdf = try_ocrmypdf(local_pdf)
         if ocr_pdf:
             try:
-                text, metadata, images = pdf_to_markdown_local(converter, ocr_pdf)
+                with time_limit(DEFAULT_STEP_TIMEOUT_SEC, desc=f"marker conversion (OCR second attempt) for {src_key}"):
+                    text, metadata, images = pdf_to_markdown_local(converter, ocr_pdf)
                 used_ocr = True
             except Exception as e:
                 print(f"Marker conversion after OCR failed for {src_key}: {e}")
