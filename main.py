@@ -346,11 +346,25 @@ def safe_folder_name_from_title(title: str) -> str:
 
 
 def safe_filename_from_doi(doi: str) -> str:
-    # Replace slashes and other problematic characters
-    name = re.sub(r"[^a-zA-Z0-9._-]", "_", doi)
+    # Reversibly encode DOI: keep [A-Za-z0-9._-], encode others as ~HH (hex)
+    def encode_char(match):
+        ch = match.group(0)
+        return f"~{ord(ch):02X}"
+
+    name = re.sub(r"[^A-Za-z0-9._-]", encode_char, doi)
     if not name.endswith(".pdf"):
         name = f"{name}.pdf"
     return name
+
+
+def decode_doi_from_filename(filename: str) -> str:
+    # Remove trailing .pdf if present and decode ~HH back to original characters
+    base = filename[:-4] if filename.lower().endswith(".pdf") else filename
+
+    def decode_match(match):
+        return chr(int(match.group(1), 16))
+
+    return re.sub(r"~([0-9A-Fa-f]{2})", decode_match, base)
 
 
 def download_pdf_to_s3(url: str, s3_client: Optional[boto3.client], s3_key: str, verify_tls: bool) -> bool:
