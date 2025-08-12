@@ -161,4 +161,61 @@ SELECT seed_article_title, COUNT(*) as count FROM articles GROUP BY seed_article
 SELECT distance, COUNT(*) as count FROM articles 
 WHERE seed_article_title LIKE '%ваш_поисковый_термин%' 
 GROUP BY distance ORDER BY distance;
-``` 
+```
+
+## Индексация S3-чанков в Elasticsearch (векторный поиск)
+
+Скрипт `elastic_create.py` читает JSON-файлы чанков из S3 бакета и индексирует их в Elasticsearch c эмбеддингами для kNN-поиска.
+
+### Переменные окружения
+
+Скрипт использует ключи из `.env` (или переменные окружения процесса):
+
+```env
+# S3 (поддерживаются как Yandex S3, так и AWS-переменные)
+S3_ENDPOINT_URL=https://storage.yandexcloud.net
+S3_BUCKET_NAME=palladium-md-to-chunks     # бакет с готовыми чанками
+# Необязательно: ограничить поддиректорией внутри бакета
+S3_PREFIX=                                # например: 10.1007_s11664-013-2609-9/
+
+# Креды (любой из форматов)
+S3_ACCESS_KEY_ID=...
+S3_SECRET_ACCESS_KEY=...
+# или AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION
+```
+
+Необязательные параметры:
+
+- `ES_INDEX_NAME` — имя индекса (по умолчанию `scientific_papers`)
+
+### Зависимости и окружение
+
+```bash
+conda activate palladium
+pip install -r requirements.txt
+```
+
+### Запуск индексации
+
+- Через `.env`:
+```bash
+python elastic_create.py
+```
+
+- С переопределением переменных без изменения `.env`:
+```bash
+S3_BUCKET_NAME=palladium-md-to-chunks python elastic_create.py
+```
+
+- Длительный запуск в фоне с логом:
+```bash
+nohup env S3_BUCKET_NAME=palladium-md-to-chunks python elastic_create.py > index.log 2>&1 &
+# смотреть лог
+tail -f index.log
+```
+
+### Важные замечания
+
+- Текущая реализация при каждом запуске пересоздаёт индекс `scientific_papers` (удаляет и создаёт заново).
+  - Если нужно сохранять существующие данные и делать upsert — дайте знать, добавим режим без пересоздания.
+- Скрипт ожидает локально работающий Elasticsearch `http://localhost:9200` и сервис эмбеддингов на `http://localhost:8080/v1` с моделью `intfloat/multilingual-e5-large-instruct`. 

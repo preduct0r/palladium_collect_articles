@@ -4,5 +4,7 @@ python-dotenv>=0.19.0
 scihub>=0.0.1 
 marker-pdf 
 langchain>=0.1.0
+langchain-openai>=0.1.0
 tiktoken>=0.5.0
 botocore>=1.29.0 
+elasticsearch[async]>=8.13.0 
