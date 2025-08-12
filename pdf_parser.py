@@ -116,6 +116,7 @@ def process_one_pdf(
     src_key: str,
     dest_bucket: str,
     min_text_len_for_no_ocr: int = 500,
+    use_ocr_by_default: bool = True,
 ) -> bool:
     # Map source key to destination keys
     dest_md_key = change_ext(src_key, ".md")
@@ -137,18 +138,35 @@ def process_one_pdf(
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return False
 
-    # First pass: no OCR (fast path)
-    try:
-        text, metadata, images = pdf_to_markdown_local(converter, local_pdf)
-    except Exception as e:
-        print(f"Marker conversion failed for {src_key}: {e}")
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        return False
-
     used_ocr = False
+    text = None
+    metadata = None
+    images = None
 
-    # If text is too short, try OCR via ocrmypdf if available
-    if (text or "").strip().__len__() < min_text_len_for_no_ocr:
+    # Try OCR first if enabled by default
+    if use_ocr_by_default:
+        ocr_pdf = try_ocrmypdf(local_pdf)
+        if ocr_pdf:
+            try:
+                text, metadata, images = pdf_to_markdown_local(converter, ocr_pdf)
+                used_ocr = True
+                print(f"OCR applied to {src_key}")
+            except Exception as e:
+                print(f"Marker conversion after OCR failed for {src_key}: {e}")
+                # Fall back to original PDF
+                pass
+
+    # If OCR wasn't used or failed, try original PDF
+    if text is None:
+        try:
+            text, metadata, images = pdf_to_markdown_local(converter, local_pdf)
+        except Exception as e:
+            print(f"Marker conversion failed for {src_key}: {e}")
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return False
+
+    # If text is still too short and we haven't tried OCR yet, try it now
+    if not used_ocr and (text or "").strip().__len__() < min_text_len_for_no_ocr:
         ocr_pdf = try_ocrmypdf(local_pdf)
         if ocr_pdf:
             try:
@@ -156,9 +174,6 @@ def process_one_pdf(
                 used_ocr = True
             except Exception as e:
                 print(f"Marker conversion after OCR failed for {src_key}: {e}")
-        else:
-            # No OCR available or failed; proceed with whatever text we got
-            pass
 
     # Upload results
     try:
