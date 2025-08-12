@@ -3,9 +3,9 @@ import json
 import os
 from typing import List, Dict, Optional
 import boto3
+import requests
 from dotenv import load_dotenv
 from elasticsearch import AsyncElasticsearch
-from langchain.embeddings import OpenAIEmbeddings
 
 # Инициализация клиента Elasticsearch
 es = AsyncElasticsearch(
@@ -14,14 +14,31 @@ es = AsyncElasticsearch(
     headers={"Accept": "application/vnd.elasticsearch+json;compatible-with=8"}
 )
 
+class TextEmbeddingsInferenceEmbedder:
+    """Прямой клиент для text-embeddings-inference API"""
+    
+    def __init__(self, base_url: str = "http://localhost:8080", model: str = "intfloat/multilingual-e5-large-instruct"):
+        self.base_url = base_url.rstrip('/')
+        self.model = model
+        
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """Создать эмбеддинги для списка текстов"""
+        response = requests.post(
+            f"{self.base_url}/v1/embeddings",
+            json={"model": self.model, "input": texts},
+            headers={"Content-Type": "application/json"},
+            timeout=30
+        )
+        response.raise_for_status()
+        result = response.json()
+        return [item["embedding"] for item in result["data"]]
+    
+    def embed_query(self, text: str) -> List[float]:
+        """Создать эмбеддинг для одного текста"""
+        return self.embed_documents([text])[0]
+
 # Инициализация эмбеддера
-embedding_kwargs = {}
-embedder = OpenAIEmbeddings(
-    model="intfloat/multilingual-e5-large-instruct", 
-    base_url="http://localhost:8080/v1",
-    api_key="EMPTY",
-    **embedding_kwargs
-)
+embedder = TextEmbeddingsInferenceEmbedder()
 
 def _get_s3_client() -> boto3.client:
     load_dotenv()
@@ -116,6 +133,8 @@ async def process_and_index_chunks(chunks: List[Dict], index_name: str = "scient
             embeddings = await asyncio.get_event_loop().run_in_executor(
                 None, embedder.embed_documents, texts
             )
+            
+            print(f"🔢 Получено эмбеддингов: {len(embeddings)}, размер: {len(embeddings[0]) if embeddings else 0}")
             
             actions = []
             
@@ -233,7 +252,7 @@ async def search_similar_text(query: str, index_name: str = "scientific_papers",
 async def main():
     """Основная функция"""
     load_dotenv()
-    bucket_name = os.getenv("S3_BUCKET_NAME", "palladium-md-to-chunks")
+    bucket_name = "palladium-md-to-chunks"
     prefix = os.getenv("S3_PREFIX")
     index_name = os.getenv("ES_INDEX_NAME", "scientific_papers")
     
