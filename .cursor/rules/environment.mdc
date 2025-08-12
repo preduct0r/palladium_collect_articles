@@ -1,0 +1,25 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+---
+description: Project environment configuration
+alwaysApply: true
+---
+
+# Окружение проекта
+
+## Основные настройки
+- Всегда используй конда окружение проекта `palladium`
+- Для выполнения Python команд используй: `conda activate palladium && python`
+- Для установки пакетов: `conda activate palladium && pip install`
+
+## Команды запуска
+- Запуск проекта: `conda activate palladium && python main.py`
+- Запуск тестов: `conda activate palladium && pytest`
+- Запуск линтеров: `conda activate palladium && flake8`
+
+## Переменные окружения
+- Используй файл `.env` для локальных настроек
+- Загружай переменные через: `python-dotenv`
