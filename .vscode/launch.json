@@ -9,7 +9,7 @@
             "name": "Python Debugger: Current File with Arguments",
             "type": "debugpy",
             "request": "launch",
-            "program": "main.py",
+            "program": "${file}",
             "console": "integratedTerminal",
             "args": ["--doi", "10.1038/srep37043", "--max-depth", "0"]
         }
