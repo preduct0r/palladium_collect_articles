@@ -3,3 +3,5 @@ pdfs/
 .env
 *.pyc
 articles*
+*.tar.gz
+chroma_db/
