@@ -11,7 +11,7 @@
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal",
-            "args": ["--doi", "10.1038/srep37043", "--max-depth", "0"]
+            // "args": ["--doi", "10.1038/srep37043", "--max-depth", "0"]
         }
     ]
 }

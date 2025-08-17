@@ -1,5 +1,7 @@
 pdfs/
 *.db
+*.db-shm
+*.db-wal
 .env
 *.pyc
 articles*
