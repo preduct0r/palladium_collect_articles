@@ -77,7 +77,7 @@ def find_required_columns(columns: List[object]) -> Optional[Dict[str, str]]:
     return mapping
 
 
-def load_and_collect_rows(input_path: Path) -> pd.DataFrame:
+def load_and_collect_rows(input_path: Path) -> Tuple[pd.DataFrame, int]:
     if not input_path.exists():
         raise FileNotFoundError(f"Input Excel file not found: {input_path}")
 
@@ -87,11 +87,14 @@ def load_and_collect_rows(input_path: Path) -> pd.DataFrame:
     )
 
     collected_frames: List[pd.DataFrame] = []
+    sheets_with_required_columns = 0
 
     for sheet_name, raw_df in excel_data.items():
         if raw_df is None or raw_df.empty:
             continue
 
+        sheet_processed = False
+        
         # Try to detect header row by values
         header_detection = find_required_columns_by_header_row(raw_df)
         if header_detection is not None:
@@ -105,43 +108,47 @@ def load_and_collect_rows(input_path: Path) -> pd.DataFrame:
                     for canonical in CANONICAL_COLUMNS
                 }
             )
+            sheet_processed = True
         else:
             # Fallback: attempt to treat the first row as header and map by names
             fallback_df = pd.read_excel(
                 input_path, sheet_name=sheet_name, dtype=object, engine="openpyxl", header=0
             )
             mapping = find_required_columns(list(fallback_df.columns))
-            if mapping is None:
-                continue
-            extracted = fallback_df[[mapping[c] for c in CANONICAL_COLUMNS]].copy()
-            extracted.columns = CANONICAL_COLUMNS
+            if mapping is not None:
+                extracted = fallback_df[[mapping[c] for c in CANONICAL_COLUMNS]].copy()
+                extracted.columns = CANONICAL_COLUMNS
+                sheet_processed = True
 
-        # Clean and drop empty rows
-        extracted.replace({"": pd.NA}, inplace=True)
-        extracted = extracted.dropna(how="all", subset=CANONICAL_COLUMNS)
+        if sheet_processed:
+            sheets_with_required_columns += 1
+            
+            # Clean and drop empty rows
+            extracted.replace({"": pd.NA}, inplace=True)
+            extracted = extracted.dropna(how="all", subset=CANONICAL_COLUMNS)
 
-        # Normalize strings
-        for col in CANONICAL_COLUMNS:
-            extracted[col] = extracted[col].astype("string").map(
-                lambda v: " ".join(v.split()).strip() if isinstance(v, str) else v
-            )
+            # Normalize strings
+            for col in CANONICAL_COLUMNS:
+                extracted[col] = extracted[col].astype("string").map(
+                    lambda v: " ".join(v.split()).strip() if isinstance(v, str) else v
+                )
 
-        # Drop rows which are effectively headers repeated in body
-        mask_is_header = extracted.apply(lambda r: all(normalize_text(r[c]) == normalize_text(c) for c in CANONICAL_COLUMNS), axis=1)
-        extracted = extracted[~mask_is_header]
+            # Drop rows which are effectively headers repeated in body
+            mask_is_header = extracted.apply(lambda r: all(normalize_text(r[c]) == normalize_text(c) for c in CANONICAL_COLUMNS), axis=1)
+            extracted = extracted[~mask_is_header]
 
-        if not extracted.empty:
-            collected_frames.append(extracted)
+            if not extracted.empty:
+                collected_frames.append(extracted)
 
     if not collected_frames:
-        return pd.DataFrame(columns=CANONICAL_COLUMNS)
+        return pd.DataFrame(columns=CANONICAL_COLUMNS), sheets_with_required_columns
 
     combined = pd.concat(collected_frames, ignore_index=True)
 
     # Final cleanup: drop duplicates
     combined = combined.drop_duplicates().reset_index(drop=True)
 
-    return combined
+    return combined, sheets_with_required_columns
 
 
 def sort_rows(df: pd.DataFrame) -> pd.DataFrame:
@@ -168,7 +175,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         )
     )
     default_input = \
-        "/home/ubuntu/kotov_projects/palladium_collect_articles/notebooks/Super.xlsx"
+        "/home/den/projects/nornikel/deep_research/collect_articles/notebooks/make_tree/Super.xlsx"
     default_output = \
         "/home/ubuntu/kotov_projects/palladium_collect_articles/notebooks/make_tree/table_tree.xlsx"
 
@@ -197,7 +204,7 @@ def main(argv: List[str]) -> int:
     output_path = Path(args.output).expanduser().resolve()
 
     try:
-        df = load_and_collect_rows(input_path)
+        df, sheets_with_required = load_and_collect_rows(input_path)
         df_sorted = sort_rows(df)
         write_output(df_sorted, output_path)
     except Exception as exc:  # pragma: no cover
@@ -206,7 +213,8 @@ def main(argv: List[str]) -> int:
 
     total_rows = len(df_sorted.index)
     processed_info = (
-        f"Created '{output_path}' with {total_rows} row(s) and columns: {', '.join(CANONICAL_COLUMNS)}\n"
+        f"Обработано вкладок с нужными столбцами: {sheets_with_required}\n"
+        f"Создан файл '{output_path}' с {total_rows} строк(ами) и столбцами: {', '.join(CANONICAL_COLUMNS)}\n"
     )
     sys.stdout.write(processed_info)
     return 0
