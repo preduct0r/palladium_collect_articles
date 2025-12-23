@@ -234,6 +234,66 @@ def get_openalex_work_by_doi(doi: str, mailto: Optional[str]) -> Optional[Dict]:
         resp = requests.get(url, headers=build_headers(mailto), params=params, timeout=20)
         if resp.status_code == 200:
             return resp.json()
+        
+        # Fallback: If direct DOI lookup fails and it's an old arXiv DOI (10.48550),
+        # OpenAlex has migrated many arXiv papers to new DOI prefixes.
+        if resp.status_code == 404:
+            arxiv_match = re.search(r'10\.48550/arxiv[\.:](\d+\.\d+v?\d*)', norm, re.IGNORECASE)
+            if arxiv_match:
+                arxiv_id = arxiv_match.group(1)
+                print(f"\n{'='*70}")
+                print(f"ERROR: Old arXiv DOI format no longer supported by OpenAlex")
+                print(f"{'='*70}")
+                print(f"DOI: {norm}")
+                print(f"arXiv ID: {arxiv_id}")
+                print(f"\nOpenAlex has migrated to a new DOI system. The old 10.48550/arXiv.*")
+                print(f"DOI format is no longer resolvable in their API.")
+                print(f"\nPossible solutions:")
+                print(f"  1. Search for the paper on OpenAlex.org by title or arXiv ID")
+                print(f"  2. Use the new DOI if available")
+                print(f"  3. Try: https://openalex.org/works?search=arxiv.org/abs/{arxiv_id}")
+                print(f"\nSearching for possible matches (this may be inaccurate)...")
+                
+                # Strategy 1: Try filtering arXiv papers specifically
+                search_url = f"{OPENALEX_BASE_URL}/works"
+                search_params = {
+                    "filter": "primary_location.source.id:S4306400194",  # arXiv source ID
+                    "search": arxiv_id,
+                    "per_page": 5,
+                }
+                if mailto:
+                    search_params["mailto"] = mailto
+                
+                try:
+                    search_resp = requests.get(search_url, headers=build_headers(mailto), params=search_params, timeout=20)
+                    if search_resp.status_code == 200:
+                        search_data = search_resp.json()
+                        results = search_data.get("results", [])
+                        
+                        # Look for exact arXiv ID match in landing pages
+                        for work in results:
+                            primary_loc = work.get("primary_location", {})
+                            landing_url = primary_loc.get("landing_page_url", "")
+                            
+                            # Check for exact match: /abs/ARXIV_ID or /abs/ARXIV_IDvVERSION
+                            if f"/abs/{arxiv_id}" in landing_url:
+                                print(f"\n✓ Found exact match in arXiv papers:")
+                                print(f"  Title: {work.get('title')}")
+                                print(f"  New DOI: {work.get('doi')}")
+                                print(f"  OpenAlex: {work.get('id')}")
+                                print(f"{'='*70}\n")
+                                return work
+                        
+                        # No exact match found
+                        print(f"\n✗ No exact match found among arXiv papers.")
+                        print(f"  Found {len(results)} potential matches but none have the exact arXiv ID.")
+                        print(f"  Cannot reliably determine which paper you're looking for.")
+                        print(f"{'='*70}\n")
+                
+                except Exception as e:
+                    print(f"  Search failed: {e}")
+                    print(f"{'='*70}\n")
+        
         return None
     except Exception:
         return None
