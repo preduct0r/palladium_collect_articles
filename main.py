@@ -491,6 +491,8 @@ def try_download_pdf_for_article(
         success = download_pdf_to_s3(direct_pdf_url, s3_client, s3_key, verify_tls=True)
         if success:
             return (direct_pdf_url, s3_key, "openalex")
+        else:
+            print(f"  Failed to download from OpenAlex: {direct_pdf_url[:80]}")
 
     if not use_scihub:
         return (None, None, None)
@@ -514,8 +516,12 @@ def try_download_pdf_for_article(
             success = download_pdf_to_s3(scihub_pdf_url, s3_client, s3_key, verify_tls=False)
             if success:
                 return (scihub_pdf_url, s3_key, "scihub")
-    except Exception:
-        pass
+            else:
+                print(f"  Failed to download from Sci-Hub: {scihub_pdf_url[:80]}")
+        else:
+            print(f"  Sci-Hub did not return PDF URL for {doi}")
+    except Exception as e:
+        print(f"  Sci-Hub error for {doi}: {e}")
 
     return (None, None, None)
 
@@ -525,6 +531,16 @@ def article_exists(conn: sqlite3.Connection, doi: str) -> bool:
     try:
         cur = conn.execute("SELECT 1 FROM articles WHERE doi = ? LIMIT 1;", (doi,))
         return cur.fetchone() is not None
+    except sqlite3.Error:
+        return False
+
+
+def article_has_pdf(conn: sqlite3.Connection, doi: str) -> bool:
+    """Return True if an article has a PDF already downloaded."""
+    try:
+        cur = conn.execute("SELECT pdf_path FROM articles WHERE doi = ? LIMIT 1;", (doi,))
+        row = cur.fetchone()
+        return row is not None and row[0] is not None and row[0] != ""
     except sqlite3.Error:
         return False
 
@@ -566,6 +582,12 @@ def process_article(
     pdf_url_used, s3_key, source_pdf = try_download_pdf_for_article(
         norm_doi, meta.best_pdf_url, s3_client, folder_name, use_scihub
     )
+    
+    # Log download result
+    if pdf_url_used:
+        print(f"✓ PDF downloaded for {norm_doi} from {source_pdf}")
+    else:
+        print(f"✗ No PDF available for {norm_doi}")
 
     # Persist self
     upsert_article(
@@ -606,7 +628,8 @@ def process_article(
         child_distance = (distance + 1) if distance is not None else None
 
         # Ensure child row exists and capture discovery depth/found_from
-        if not article_exists(conn, child_doi):
+        is_new = not article_exists(conn, child_doi)
+        if is_new:
             upsert_article(conn, child_meta, distance=child_distance, found_from_doi=norm_doi, seed_article_title=seed_article_title)
             children_dois.append(child_doi)
             debug_stats["added_to_queue"] += 1
@@ -614,6 +637,11 @@ def process_article(
             # Fill missing distance/found_from_doi if not set
             upsert_article(conn, child_meta, distance=child_distance, found_from_doi=norm_doi, seed_article_title=seed_article_title)
             debug_stats["already_exists"] += 1
+            
+            # If existing article has no PDF, add it to queue for retry
+            if not article_has_pdf(conn, child_doi):
+                children_dois.append(child_doi)
+                debug_stats["added_to_queue"] += 1
 
         # Now relation can be recorded (FK-safe)
         insert_relation(conn, from_doi=norm_doi, to_doi=child_doi, relation="references")
